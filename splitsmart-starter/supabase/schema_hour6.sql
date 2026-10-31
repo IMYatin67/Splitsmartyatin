@@ -1,0 +1,73 @@
+-- SplitSmart — groups, membership, and multi-tenant Row-Level Security
+--
+-- HOW TO RUN THIS (after you've already run schema.sql):
+--   1. Supabase → left sidebar → SQL Editor → + New query
+--   2. Paste everything in this file → Run (Cmd/Ctrl + Enter)
+--   3. You should see "Success. No rows returned."
+--
+-- Safe to run more than once.
+
+-- a GROUP is one "tenant" (Goa Trip, Flat 304, ...). join_code lets friends join.
+create table if not exists groups (
+  id         uuid primary key default gen_random_uuid(),
+  name       text not null,
+  join_code  text not null unique default upper(substr(md5(random()::text), 1, 6)),
+  created_by uuid not null references auth.users(id) on delete cascade,
+  created_at timestamptz not null default now()
+);
+
+-- who belongs to which group
+create table if not exists group_members (
+  group_id  uuid not null references groups(id) on delete cascade,
+  user_id   uuid not null references auth.users(id) on delete cascade,
+  joined_at timestamptz not null default now(),
+  primary key (group_id, user_id)
+);
+
+-- every expense now belongs to a group
+alter table expenses add column if not exists group_id uuid references groups(id) on delete cascade;
+
+-- helper: "is the logged-in person a member of this group?"
+-- SECURITY DEFINER lets it check membership WITHOUT tripping RLS recursion.
+create or replace function is_group_member(gid uuid)
+returns boolean language sql security definer stable
+set search_path = public as $$
+  select exists (select 1 from group_members
+                 where group_id = gid and user_id = auth.uid());
+$$;
+
+-- join a group by its code (runs as owner, so it can find the group)
+create or replace function join_group(code text)
+returns uuid language plpgsql security definer
+set search_path = public as $$
+declare gid uuid;
+begin
+  select id into gid from groups where join_code = upper(trim(code));
+  if gid is null then raise exception 'No group with that code'; end if;
+  insert into group_members (group_id, user_id) values (gid, auth.uid())
+    on conflict do nothing;
+  return gid;
+end; $$;
+
+-- turn on Row-Level Security, then the rules (safe to re-run)
+alter table groups        enable row level security;
+alter table group_members enable row level security;
+alter table expenses      enable row level security;
+
+drop policy if exists "see my groups"         on groups;
+drop policy if exists "create groups"         on groups;
+drop policy if exists "see my memberships"    on group_members;
+drop policy if exists "join groups"           on group_members;
+drop policy if exists "see group expenses"    on expenses;
+drop policy if exists "add group expenses"    on expenses;
+drop policy if exists "delete group expenses" on expenses;
+
+create policy "see my groups"      on groups for select using (is_group_member(id));
+create policy "create groups"      on groups for insert with check (auth.uid() = created_by);
+
+create policy "see my memberships" on group_members for select using (user_id = auth.uid());
+create policy "join groups"        on group_members for insert with check (user_id = auth.uid());
+
+create policy "see group expenses"    on expenses for select using (is_group_member(group_id));
+create policy "add group expenses"    on expenses for insert with check (is_group_member(group_id));
+create policy "delete group expenses" on expenses for delete using (is_group_member(group_id));
